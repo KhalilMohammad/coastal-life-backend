@@ -4,13 +4,21 @@ const csvParser = require("csv-parser");
 const moment = require("moment");
 const mysql = require("mysql2");
 const cors = require("cors");
-
+const Busboy = require("busboy");
+const status = require("express-status-monitor")
+const fs = require("fs"); 
 const app = express();
 const port = 3001;
 app.use(cors());
-
+app.use(status())
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
+const config = {
+  api: {
+    basePath: "/", 
+  },
+};
+let insertCounter = 0;
 
 const db = mysql.createConnection({
   host: "localhost",
@@ -29,57 +37,108 @@ db.connect((err) => {
   console.log("Connected to the database");
 });
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    const fileBuffer = req.file.buffer;
 
-    const results = [];
-    let columns;
+app.post("/upload", async (req, res) => {
+  const busboy = new Busboy({ headers: req.headers });
 
-  const readableStream = require("stream").Readable;
-      const stream = new readableStream();
-      stream.push(fileBuffer);
-      stream.push(null);
-  
-      stream
-        .pipe(csvParser({ delimiter: "," }))
-        .on("data", (data) => {
-          if (!columns) {
-            columns = Object.keys(data);
-          }
-          data.mls_failedListingDate = moment(
-            data.mls_failedListingDate,
-            "DD/MM/YYYY"
-          ).format("YYYY-MM-DD");
-          data.mls_maxListPriceDate = moment(
-            data.mls_maxListPriceDate,
-            "DD/MM/YYYY"
-          ).format("YYYY-MM-DD");
-          data.mls_minListPriceDate = moment(
-            data.mls_minListPriceDate,
-            "DD/MM/YYYY"
-          ).format("YYYY-MM-DD");
-          data.mls_originalListingDate = moment(
-            data.mls_originalListingDate,
-            "DD/MM/YYYY"
-          ).format("YYYY-MM-DD");
-          data.mls_soldDate = moment(data.mls_soldDate, "DD/MM/YYYY").format(
-            "YYYY-MM-DD"
-          );
-          data.entryDate = moment(data.entryDate, "DD/MM/YYYY").format(
-            "YYYY-MM-DD"
-          );
-          results.push(data);
-        })
-        .on("end", () => {
-          insertIntoDatabase(results, columns, res);
+  busboy.on("file", (fieldname, file, filename) => {
+    const filePath = config.api.basePath + filename;
+
+    file.pipe(fs.createWriteStream(filePath));
+
+    file.on("end", async () => {
+      try {
+        await processCSV("yourcsvName", filePath);
+        res.status(200).json({
+          success: true,
+          message: "CSV processing completed successfully",
         });
-    } catch (error) {
-      console.error("Error handling file upload:", error.message);
-      res.status(500).send("Internal Server Error");
-    }
+      } catch (error) {
+        console.error("Error processing CSV:", error.message);
+        res.status(500).send("Internal Server Error");
+      }
+    });
   });
 
+  req.pipe(busboy);
+});
+
+async function processCSV(csvName, filePath) {
+  return new Promise((resolve, reject) => {
+    let numConcurrent = 0;
+    let paused = false;
+    const maxConcurrent = 1000;
+
+    const stream = fs.createReadStream(filePath)
+      .on("error", (err) => {
+        console.log("Error processing CSV:", err);
+        reject(err);
+      })
+      .pipe(csvParser())
+      .on("data", async (row) => {
+        async function checkResume() {
+          --numConcurrent;
+          if (paused && numConcurrent < maxConcurrent) {
+            paused = false;
+            stream.resume();
+          }
+        }
+        ++numConcurrent;
+        try {
+          createcsv(csvName, row);
+          row.mls_failedListingDate = moment(
+            row.mls_failedListingDate,
+            "MM/DD/YYYY"
+          ).format("YYYY-MM-DD");
+          row.mls_maxListPriceDate = moment(
+            row.mls_maxListPriceDate,
+            "MM/DD/YYYY"
+          ).format("YYYY-MM-DD");
+          row.mls_minListPriceDate = moment(
+            row.mls_minListPriceDate,
+            "MM/DD/YYYY"
+          ).format("YYYY-MM-DD");
+          row.mls_originalListingDate = moment(
+            row.mls_originalListingDate,
+            "MM/DD/YYYY"
+          ).format("YYYY-MM-DD");
+          row.mls_soldDate = moment(row.mls_soldDate, "MM/DD/YYYY").format(
+            "YYYY-MM-DD"
+          );
+          row.entryDate = moment(row.entryDate, "MM/DD/YYYY").format(
+            "YYYY-MM-DD"
+          );
+          await insertIntoDatabase([row], Object.keys(row));
+
+          checkResume();
+        } catch (error) {
+          checkResume();
+        }
+        if (numConcurrent >= maxConcurrent) {
+          stream.pause();
+          paused = true;
+        }
+      })
+      .on("end", () => {
+        console.log("Finished processing CSV");
+        resolve(filePath);
+      });
+  });
+}
+async function createcsv(name, data) {
+  const { hostname, port, ip } = data;
+  let protocol = 'https';
+  if (port === 80) {
+    protocol = 'http';
+  }
+  const url = protocol + '://' + hostname;
+  
+  try {
+    return url;
+  } catch (error) {
+    throw error;
+  }
+}
 app.get("/getData", async (req, res) => {
   try {
     const {
@@ -92,12 +151,15 @@ app.get("/getData", async (req, res) => {
       mls_soldDate,
       mls_status,
       startDate,
-      endDate
+      endDate,
+      page = 1,
+      pageSize = 20,
     } = req.query;
 
     let query = "SELECT * FROM coastallife";
     let countQuery = "SELECT COUNT(*) as total FROM coastallife";
     let conditions = [];
+    const offset = (page - 1) * pageSize;
 
     if (address_city || address_state || mls_propertyType || mls_propertySubtype || address_zip || address_county || mls_soldDate || mls_status || startDate || endDate) {
       query += " WHERE ";
@@ -151,7 +213,7 @@ app.get("/getData", async (req, res) => {
   countQuery += conditions.join(" AND ");
 }
 
-    query += " ORDER BY entryDate";
+    query += ` ORDER BY entryDate LIMIT ${pageSize} OFFSET ${offset}`;
 
     const [result, totalItems] = await Promise.all([
       db.promise().query(query),
@@ -166,56 +228,63 @@ app.get("/getData", async (req, res) => {
   }
 });
 console.log("")
-async function insertIntoDatabase(data, columns, res) {
+async function insertIntoDatabase(data, columns) {
   try {
     if (!columns || columns.length === 0) {
       throw new Error("Columns are undefined or empty");
     }
 
-    const columnNames = columns
-      .map((column) => mysql.escapeId(column))
-      .join(", ");
-    const placeholders = Array(columns.length)
-      .fill("?")
-      .join(", ");
-    const values = [];
+    const batchSize = 1300; 
+    const totalRows = data.length;
 
-    for (const record of data) {
-      values.push(...columns.map((column) => record[column]));
+    for (let i = 0; i < totalRows; i += batchSize) {
+      const batchData = data.slice(i, i + batchSize);
+      const batchValues = [];
+
+      for (const record of batchData) {
+        batchValues.push(...columns.map((column) => record[column]));
+      }
+
+      const columnNames = columns
+  .map((column) => mysql.escapeId(column))
+  .join(", ");
+const placeholders = Array(columns.length)
+  .fill("?")
+  .join(", ");
+const placeholdersPerRow = Array(batchData.length)
+  .fill(`(${placeholders})`)
+  .join(", ");
+
+      const sql = `INSERT IGNORE INTO coastallife (${columnNames}) VALUES ${placeholdersPerRow}`;
+
+      await db.promise().query(sql, batchValues);
+      insertCounter++;
+
     }
 
-    const rowCount = data.length;
-    const placeholdersPerRow = Array(rowCount)
-      .fill(`(${placeholders})`)
-      .join(", ");
-
-    const sql = `INSERT IGNORE INTO coastallife (${columnNames}) VALUES ${placeholdersPerRow}`;
-
-    await db.promise().query(sql, values);
-
-    console.log("Data inserted into the database successfully");
-    res.status(200).json({
+    console.log(`Data inserted into the database successfully, ${insertCounter} rows inserted`);
+    return {
       success: true,
       message: "Data inserted into the database successfully",
-    });
+    };
   } catch (error) {
     console.error("Error handling data insertion:", error.message);
-    if (error.code === "ER_BAD_FIELD_ERROR") {
-      res.status(500).json({
-        success: false,
-        message: "Unknown column in database",
-        errorType: "unknown_column",
-      });
-    } else {
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Error inserting data into the database",
-        });
+
+    const response = {
+      success: false,
+      message: "Error inserting data into the database",
+    };
+
+    if (error && error.code === "ER_BAD_FIELD_ERROR") {
+      response.errorType = "unknown_column";
+      response.message = "Unknown column in the database";
     }
+
+    return response;
   }
 }
+
+
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
