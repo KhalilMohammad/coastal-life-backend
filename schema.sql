@@ -1,3 +1,6 @@
+CREATE DATABASE CoastalLife;
+USE CoastalLife;
+
 CREATE TABLE Document (
   id INT AUTO_INCREMENT PRIMARY KEY,
   propertyId TEXT NULL,
