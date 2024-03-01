@@ -1,57 +1,86 @@
-const express = require("express");
-const multer = require("multer");
-const csvParser = require("csv-parser");
-const moment = require("moment");
-const mysql = require("mysql2");
-const cors = require("cors");
-const Busboy = require("busboy");
-const status = require("express-status-monitor")
-const fs = require("fs"); 
+"use strict";
+
+import Busboy from "busboy";
+import cors from "cors";
+import csvParser from "csv-parser";
+import express from "express";
+import status from "express-status-monitor";
+import { createReadStream, createWriteStream } from "fs";
+import http from "http";
+import { DateTime } from "luxon";
+import { createConnection, escape, escapeId } from "mysql2/promise";
+import { Queue, Worker } from 'bullmq';
+import { parse } from 'json2csv';
+
+
+const { fromFormat } = DateTime;
 const app = express();
-const port = 3001;
-app.use(cors());
-app.use(status())
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+app.use(
+  cors({
+    origin: "http://localhost:3000",
+  })
+);
+app.use(status());
+
 const config = {
   api: {
-    basePath: "/", 
+    basePath: "/",
   },
 };
+const redisConnection = {
+  host: "localhost",
+  port: 6379,
+};
+const queue = new Queue("CoastalLife", { connection: redisConnection });
 let insertCounter = 0;
 
-const db = mysql.createConnection({
+new Worker(
+  "CoastalLife",
+  async (job) => {
+    if (job.name === "process-document") {
+      await processCSV(job.data.filePath, job.data.totalRows, job.id);
+    }
+  },
+  {
+    concurrency: 100,
+    connection: redisConnection,
+  }
+);
+
+const db = await createConnection({
   host: "localhost",
   user: "root",
-  password: "12345678",
-  database: "coastallife",
+  password: "my-secret-pw",
+  database: "CoastalLife",
   multipleStatements: true,
-  port: 3307,
 });
 
-db.connect((err) => {
-  if (err) {
-    console.error("Database connection failed: " + err.stack);
-    process.exit(1);
-  }
-  console.log("Connected to the database");
-});
+app.post("/upload", (req, res) => {
+  const busboy = Busboy({ headers: req.headers });
 
-
-app.post("/upload", async (req, res) => {
-  const busboy = new Busboy({ headers: req.headers });
-
-  busboy.on("file", (fieldname, file, filename) => {
+  busboy.on("file", (fieldname, file, { filename }) => {
     const filePath = config.api.basePath + filename;
+    let totalRows = 0;
 
-    file.pipe(fs.createWriteStream(filePath));
-
+    file.pipe(createWriteStream(filePath));
+    file.on("data", function (chunk) {
+      for (let i = 0; i < chunk.length; ++i) {
+        if (chunk[i] == 10) totalRows++;
+      }
+    });
     file.on("end", async () => {
       try {
-        await processCSV("yourcsvName", filePath);
+        const job = await queue.add("process-document", {
+          filePath,
+          totalRows,
+          id: req.query.id,
+          startingTime: new Date(),
+        });
         res.status(200).json({
           success: true,
           message: "CSV processing completed successfully",
+          totalRows,
+          jobId: job.id,
         });
       } catch (error) {
         console.error("Error processing CSV:", error.message);
@@ -63,178 +92,120 @@ app.post("/upload", async (req, res) => {
   req.pipe(busboy);
 });
 
-async function processCSV(csvName, filePath) {
+async function processCSV(filePath, totalRows, jobId) {
   return new Promise((resolve, reject) => {
     let numConcurrent = 0;
-    let paused = false;
     const maxConcurrent = 1000;
+    let rows = [];
+    let rowsProcessed = 0;
 
-    const stream = fs.createReadStream(filePath)
+    const stream = createReadStream(filePath)
       .on("error", (err) => {
         console.log("Error processing CSV:", err);
         reject(err);
       })
       .pipe(csvParser())
       .on("data", async (row) => {
-        async function checkResume() {
-          --numConcurrent;
-          if (paused && numConcurrent < maxConcurrent) {
-            paused = false;
-            stream.resume();
-          }
-        }
-        ++numConcurrent;
-        try {
-          createcsv(csvName, row);
-          row.mls_failedListingDate = moment(
-            row.mls_failedListingDate,
-            "MM/DD/YYYY"
-          ).format("YYYY-MM-DD");
-          row.mls_maxListPriceDate = moment(
-            row.mls_maxListPriceDate,
-            "MM/DD/YYYY"
-          ).format("YYYY-MM-DD");
-          row.mls_minListPriceDate = moment(
-            row.mls_minListPriceDate,
-            "MM/DD/YYYY"
-          ).format("YYYY-MM-DD");
-          row.mls_originalListingDate = moment(
-            row.mls_originalListingDate,
-            "MM/DD/YYYY"
-          ).format("YYYY-MM-DD");
-          row.mls_soldDate = moment(row.mls_soldDate, "MM/DD/YYYY").format(
-            "YYYY-MM-DD"
-          );
-          row.entryDate = moment(row.entryDate, "MM/DD/YYYY").format(
-            "YYYY-MM-DD"
-          );
-          await insertIntoDatabase([row], Object.keys(row));
+        numConcurrent++;
+        rowsProcessed++;
+        row.entryDate = fromFormat(row.entryDate, "MM/DD/YYYY").toFormat(
+          "YYYY-MM-DD"
+        );
+        row.mls_failedListingDate = fromFormat(
+          row.mls_failedListingDate,
+          "MM/DD/YYYY"
+        ).toFormat("YYYY-MM-DD");
+        row.mls_maxListPriceDate = fromFormat(
+          row.mls_maxListPriceDate,
+          "MM/DD/YYYY"
+        ).toFormat("YYYY-MM-DD");
+        row.mls_minListPriceDate = fromFormat(
+          row.mls_minListPriceDate,
+          "MM/DD/YYYY"
+        ).toFormat("YYYY-MM-DD");
+        row.mls_originalListingDate = fromFormat(
+          row.mls_originalListingDate,
+          "MM/DD/YYYY"
+        ).toFormat("YYYY-MM-DD");
+        row.mls_soldDate = fromFormat(row.mls_soldDate, "MM/DD/YYYY").toFormat(
+          "YYYY-MM-DD"
+        );
+        rows.push(row);
 
-          checkResume();
-        } catch (error) {
-          checkResume();
-        }
         if (numConcurrent >= maxConcurrent) {
           stream.pause();
-          paused = true;
+
+          await Promise.all([
+            insertIntoDatabase(rows, Object.keys(row)),
+            queue.updateJobProgress(jobId, {
+              progress: (rowsProcessed / totalRows) * 100,
+              rowsProcessed,
+              totalRows,
+            }),
+          ]);
+          stream.resume();
+          rows = [];
+          numConcurrent = 0;
         }
       })
-      .on("end", () => {
+      .on("end", async () => {
         console.log("Finished processing CSV");
-        resolve(filePath);
+        const job = await queue.getJob(jobId);
+        job.updateData({
+          ...job.data,
+          endingDate: new Date(),
+        });
+        if (rows.length > 0) {
+          await Promise.all([
+            insertIntoDatabase(rows, Object.keys(rows[0])),
+            job.updateProgress({
+              progress: 100,
+              rowsProcessed,
+              totalRows,
+            }),
+          ]);
+
+          rows = [];
+          numConcurrent = 0;
+        }
+        resolve();
       });
   });
 }
-async function createcsv(name, data) {
-  const { hostname, port, ip } = data;
-  let protocol = 'https';
-  if (port === 80) {
-    protocol = 'http';
-  }
-  const url = protocol + '://' + hostname;
-  
-  try {
-    return url;
-  } catch (error) {
-    throw error;
-  }
-}
+
 app.get("/getData", async (req, res) => {
   try {
-    const {
-      address_city,
-      address_state,
-      mls_propertyType,
-      mls_propertySubtype,
-      address_zip,
-      address_county,
-      mls_soldDate,
-      mls_status,
-      startDate,
-      endDate,
-      page = 1,
-      pageSize = 20,
-    } = req.query;
-
-    let query = "SELECT * FROM coastallife";
-    let countQuery = "SELECT COUNT(*) as total FROM coastallife";
-    let conditions = [];
-    const offset = (page - 1) * pageSize;
-
-    if (address_city || address_state || mls_propertyType || mls_propertySubtype || address_zip || address_county || mls_soldDate || mls_status || startDate || endDate) {
-      query += " WHERE ";
-      countQuery += " WHERE ";
-    }
-
-    if (address_city) {
-      conditions.push(`address_city = ${mysql.escape(address_city)}`);
-    }
-
-    if (address_state) {
-      conditions.push(`address_state = ${mysql.escape(address_state)}`);
-    }
-
-    if (mls_propertyType) {
-      conditions.push(`mls_propertyType = ${mysql.escape(mls_propertyType)}`);
-    }
-
-    if (mls_propertySubtype) {
-      conditions.push(`mls_propertySubtype = ${mysql.escape(mls_propertySubtype)}`);
-    }
-
-    if (address_zip) {
-      conditions.push(`address_zip = ${mysql.escape(address_zip)}`);
-    }
-
-    if (address_county) {
-      conditions.push(`address_county = ${mysql.escape(address_county)}`);
-    }
-
-    if (mls_soldDate) {
-      const formattedDate = moment(mls_soldDate, 'MM/DD/YYYY').format('YYYY-MM-DD');
-      conditions.push(`mls_soldDate = ${mysql.escape(formattedDate)}`);
-    }
-
-    if (mls_status) {
-      conditions.push(`mls_status = ${mysql.escape(mls_status)}`);
-    }
-
-    if (startDate && endDate) {
-      const formattedStartDate = moment(startDate, 'MM/DD/YYYY').format('YYYY-MM-DD');
-      const formattedEndDate = moment(endDate, 'MM/DD/YYYY').format('YYYY-MM-DD');
-      conditions.push(`entryDate BETWEEN ${mysql.escape(formattedStartDate)} AND ${mysql.escape(formattedEndDate)}`);
-    } else if (startDate) {
-      const formattedStartDate = moment(startDate, 'MM/DD/YYYY').format('YYYY-MM-DD');
-      conditions.push(`entryDate = ${mysql.escape(formattedStartDate)}`);
-    }
-
-    if (conditions.length > 0) {
-  query += conditions.join(" AND ");
-  countQuery += conditions.join(" AND ");
-}
-
-    query += ` ORDER BY entryDate LIMIT ${pageSize} OFFSET ${offset}`;
+    const { query, countQuery } = getSqlQuery(req);
 
     const [result, totalItems] = await Promise.all([
-      db.promise().query(query),
-      db.promise().query(countQuery),
+      db.query(query),
+      db.query(countQuery),
     ]);
     console.log("Generated query:", query);
 
-    res.status(200).json({ data: result[0], totalItems: totalItems[0][0].total });
+    res
+      .status(200)
+      .json({ data: result[0], totalItems: totalItems[0][0].total });
   } catch (error) {
     console.error("Error handling data retrieval:", error.message);
     res.status(500).send("Internal Server Error");
   }
 });
-console.log("")
+
+app.get("/progress", async (req, res) => {
+  const { jobId } = req.query;
+  const job = await queue.getJob(jobId);
+
+  res.status(200).json({ ...job.progress, ...job.data });
+});
+
 async function insertIntoDatabase(data, columns) {
   try {
     if (!columns || columns.length === 0) {
       throw new Error("Columns are undefined or empty");
     }
 
-    const batchSize = 1300; 
+    const batchSize = 1300;
     const totalRows = data.length;
 
     for (let i = 0; i < totalRows; i += batchSize) {
@@ -245,24 +216,21 @@ async function insertIntoDatabase(data, columns) {
         batchValues.push(...columns.map((column) => record[column]));
       }
 
-      const columnNames = columns
-  .map((column) => mysql.escapeId(column))
-  .join(", ");
-const placeholders = Array(columns.length)
-  .fill("?")
-  .join(", ");
-const placeholdersPerRow = Array(batchData.length)
-  .fill(`(${placeholders})`)
-  .join(", ");
+      const columnNames = columns.map((column) => escapeId(column)).join(", ");
+      const placeholders = Array(columns.length).fill("?").join(", ");
+      const placeholdersPerRow = Array(batchData.length)
+        .fill(`(${placeholders})`)
+        .join(", ");
 
-      const sql = `INSERT IGNORE INTO coastallife (${columnNames}) VALUES ${placeholdersPerRow}`;
+      const sql = `INSERT IGNORE INTO Document (${columnNames}) VALUES ${placeholdersPerRow}`;
 
-      await db.promise().query(sql, batchValues);
+      await db.query(sql, batchValues);
       insertCounter++;
-
     }
 
-    console.log(`Data inserted into the database successfully, ${insertCounter} rows inserted`);
+    console.log(
+      `Data inserted into the database successfully, ${insertCounter} rows inserted`
+    );
     return {
       success: true,
       message: "Data inserted into the database successfully",
@@ -284,8 +252,131 @@ const placeholdersPerRow = Array(batchData.length)
   }
 }
 
+const server = http.createServer(app);
 
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+server.listen(3001, () => {
+  console.log("listening on *:3001");
 });
+
+app.get("/exportCSV", async (req, res) => {
+  try {
+    const { query } = getSqlQuery(req);
+    const [rows] = await db.query(query);
+
+    if (rows.length === 0) {
+      return res.status(404).send("No data found to export.");
+    }
+
+    const csvFields = Object.keys(rows[0]);
+    const csvData = parse(rows, { fields: csvFields });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="data.csv"');
+    res.status(200).send(csvData);
+  } catch (error) {
+    console.error("Error exporting data as CSV:", error.message);
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+function getSqlQuery(req, isExport) {
+  const {
+    address_city,
+    address_state,
+    mls_propertyType,
+    mls_propertySubtype,
+    address_zip,
+    address_county,
+    mls_soldDate,
+    mls_status,
+    startDate,
+    endDate,
+    page = 1,
+    pageSize = 20,
+  } = req.query;
+
+  let query = "SELECT * FROM Document";
+  let countQuery = "SELECT COUNT(*) as total FROM Document";
+  let conditions = [];
+  const offset = (page - 1) * pageSize;
+
+  if (
+    address_city ||
+    address_state ||
+    mls_propertyType ||
+    mls_propertySubtype ||
+    address_zip ||
+    address_county ||
+    mls_soldDate ||
+    mls_status ||
+    startDate ||
+    endDate
+  ) {
+    query += " WHERE ";
+    countQuery += " WHERE ";
+  }
+
+  if (address_city) {
+    conditions.push(`address_city = ${escape(address_city)}`);
+  }
+
+  if (address_state) {
+    conditions.push(`address_state = ${escape(address_state)}`);
+  }
+
+  if (mls_propertyType) {
+    conditions.push(`mls_propertyType = ${escape(mls_propertyType)}`);
+  }
+
+  if (mls_propertySubtype) {
+    conditions.push(`mls_propertySubtype = ${escape(mls_propertySubtype)}`);
+  }
+
+  if (address_zip) {
+    conditions.push(`address_zip = ${escape(address_zip)}`);
+  }
+
+  if (address_county) {
+    conditions.push(`address_county = ${escape(address_county)}`);
+  }
+
+  if (mls_soldDate) {
+    const formattedDate = fromFormat(mls_soldDate, "MM/DD/YYYY").toFormat(
+      "YYYY-MM-DD"
+    );
+    conditions.push(`mls_soldDate = ${escape(formattedDate)}`);
+  }
+
+  if (mls_status) {
+    conditions.push(`mls_status = ${escape(mls_status)}`);
+  }
+
+  if (startDate && endDate) {
+    const formattedStartDate = fromFormat(startDate, "MM/DD/YYYY").toFormat(
+      "YYYY-MM-DD"
+    );
+    const formattedEndDate = fromFormat(endDate, "MM/DD/YYYY").toFormat(
+      "YYYY-MM-DD"
+    );
+    conditions.push(
+      `entryDate BETWEEN ${escape(formattedStartDate)} AND ${escape(
+        formattedEndDate
+      )}`
+    );
+  } else if (startDate) {
+    const formattedStartDate = fromFormat(startDate, "MM/DD/YYYY").toFormat(
+      "YYYY-MM-DD"
+    );
+    conditions.push(`entryDate = ${escape(formattedStartDate)}`);
+  }
+
+  if (conditions.length > 0) {
+    query += conditions.join(" AND ");
+    countQuery += conditions.join(" AND ");
+  }
+  if (isExport)
+    query += ` ORDER BY entryDate`;
+  else
+    query += ` ORDER BY entryDate LIMIT ${pageSize} OFFSET ${offset}`;
+  return { query, countQuery };
+}
