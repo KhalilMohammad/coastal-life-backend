@@ -5,6 +5,7 @@ import Busboy from "busboy";
 import cors from "cors";
 import { createHash } from "crypto";
 import csvParser from "csv-parser";
+import "dotenv/config";
 import express from "express";
 import status from "express-status-monitor";
 import { createReadStream, createWriteStream } from "fs";
@@ -17,7 +18,7 @@ const { fromFormat } = DateTime;
 const app = express();
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin: process.env.CORS_ORIGIN,
   })
 );
 app.use(status());
@@ -29,7 +30,7 @@ const config = {
 };
 const redisConnection = {
   host: "localhost",
-  port: 6379,
+  port: process.env.REDIS_PORT,
 };
 const queue = new Queue("CoastalLife", { connection: redisConnection });
 let insertCounter = 0;
@@ -49,8 +50,8 @@ new Worker(
 
 const db = await createConnection({
   host: "localhost",
-  user: "root",
-  password: "my-secret-pw",
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
   database: "CoastalLife",
   multipleStatements: true,
 });
