@@ -96,12 +96,12 @@ const calculateUniqueHash = (data) => {
   return createHash("sha256")
     .update(
       data.mls_status +
-      data.address_state +
-      data.address_zip +
-      data.address_county +
-      data.address_city +
-      data.address_houseNumber +
-      data.address_street
+        data.address_state +
+        data.address_zip +
+        data.address_county +
+        data.address_city +
+        data.address_houseNumber +
+        data.address_street
     )
     .digest("base64");
 };
@@ -163,14 +163,22 @@ async function processCSV(filePath, totalRows, jobId) {
         if (numConcurrent >= maxConcurrent) {
           stream.pause();
 
-          await Promise.all([
-            insertIntoDatabase(rows, Object.keys(row)),
-            queue.updateJobProgress(jobId, {
-              progress: (rowsProcessed / totalRows) * 100,
-              rowsProcessed,
-              totalRows,
-            }),
-          ]);
+          try {
+            await Promise.all([
+              insertIntoDatabase(rows, Object.keys(row), jobId),
+              queue.updateJobProgress(jobId, {
+                progress: (rowsProcessed / totalRows) * 100,
+                rowsProcessed,
+                totalRows,
+              }),
+            ]);
+            console.log(
+              `Data inserted into the database successfully, ${rows.length} rows inserted`
+            );
+          } catch (error) {
+            rows = [];
+            stream.end();
+          }
           stream.resume();
           rows = [];
           numConcurrent = 0;
@@ -192,6 +200,9 @@ async function processCSV(filePath, totalRows, jobId) {
               totalRows,
             }),
           ]);
+          console.log(
+            `Data inserted into the database successfully, ${rows.length} rows inserted`
+          );
 
           rows = [];
           numConcurrent = 0;
@@ -228,7 +239,7 @@ app.get("/progress", async (req, res) => {
   res.status(200).json({ ...job.progress, ...job.data });
 });
 
-async function insertIntoDatabase(data, columns) {
+async function insertIntoDatabase(data, columns, jobId) {
   try {
     if (!columns || columns.length === 0) {
       throw new Error("Columns are undefined or empty");
@@ -249,14 +260,6 @@ async function insertIntoDatabase(data, columns) {
 
     await db.query(sql, insertValues);
     insertCounter++;
-
-    console.log(
-      `Data inserted into the database successfully, ${insertValues.length} rows inserted`
-    );
-    return {
-      success: true,
-      message: "Data inserted into the database successfully",
-    };
   } catch (error) {
     console.error("Error handling data insertion:", error.message);
 
@@ -270,15 +273,30 @@ async function insertIntoDatabase(data, columns) {
       response.message = "Unknown column in the database";
     }
 
-    return response;
+    const regex = /'([^']+)'/;
+    const match = error.sqlMessage.match(regex);
+    if (match && match.length > 1) {
+      const job = await queue.getJob(jobId);
+      if (job) {
+        const invalidNames = new Set();
+        invalidNames.add(match[1]);
+        if (job.data && job.data.invalidNames) {
+          for (let index = 0; index < job.data.invalidNames.length; index++) {
+            const invalidName = job.data.invalidNames[index];
+            invalidNames.add(invalidName);
+          }
+        }
+
+        if (invalidNames.size > 0) {
+          await job.updateData({
+            ...job.data,
+            invalidNames: Array.from(invalidNames),
+          });
+        }
+      }
+    }
   }
 }
-
-const server = http.createServer(app);
-
-server.listen(3001, () => {
-  console.log("listening on *:3001");
-});
 
 app.get("/exportCSV", async (req, res) => {
   try {
@@ -398,9 +416,14 @@ function getSqlQuery(req, isExport) {
   }
   if (isExport) {
     query += ` ORDER BY entryDate`;
-  }
-  else {
+  } else {
     query += ` ORDER BY entryDate LIMIT ${pageSize} OFFSET ${offset}`;
   }
   return { query, countQuery };
 }
+
+const server = http.createServer(app);
+
+server.listen(3001, () => {
+  console.log("listening on *:3001");
+});
