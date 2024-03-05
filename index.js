@@ -1,17 +1,17 @@
 "use strict";
 
+import { Queue, Worker } from "bullmq";
 import Busboy from "busboy";
 import cors from "cors";
+import { createHash } from "crypto";
 import csvParser from "csv-parser";
 import express from "express";
 import status from "express-status-monitor";
 import { createReadStream, createWriteStream } from "fs";
 import http from "http";
+import { parse } from "json2csv";
 import { DateTime } from "luxon";
 import { createConnection, escape, escapeId } from "mysql2/promise";
-import { Queue, Worker } from 'bullmq';
-import { parse } from 'json2csv';
-
 
 const { fromFormat } = DateTime;
 const app = express();
@@ -92,6 +92,20 @@ app.post("/upload", (req, res) => {
   req.pipe(busboy);
 });
 
+const calculateUniqueHash = (data) => {
+  return createHash("sha256")
+    .update(
+      data.mls_status +
+      data.address_state +
+      data.address_zip +
+      data.address_county +
+      data.address_city +
+      data.address_houseNumber +
+      data.address_street
+    )
+    .digest("base64");
+};
+
 async function processCSV(filePath, totalRows, jobId) {
   return new Promise((resolve, reject) => {
     let numConcurrent = 0;
@@ -138,10 +152,12 @@ async function processCSV(filePath, totalRows, jobId) {
           ).toFormat("YYYY-MM-DD");
         }
         if (row.mls_soldDate) {
-          row.mls_soldDate = fromFormat(row.mls_soldDate, "MM/DD/YYYY").toFormat(
-            "YYYY-MM-DD"
-          );
+          row.mls_soldDate = fromFormat(
+            row.mls_soldDate,
+            "MM/DD/YYYY"
+          ).toFormat("YYYY-MM-DD");
         }
+        row.uniqueHash = calculateUniqueHash(row);
         rows.push(row);
 
         if (numConcurrent >= maxConcurrent) {
@@ -218,31 +234,24 @@ async function insertIntoDatabase(data, columns) {
       throw new Error("Columns are undefined or empty");
     }
 
-    const batchSize = 1300;
-    const totalRows = data.length;
-
-    for (let i = 0; i < totalRows; i += batchSize) {
-      const batchData = data.slice(i, i + batchSize);
-      const batchValues = [];
-
-      for (const record of batchData) {
-        batchValues.push(...columns.map((column) => record[column]));
-      }
-
-      const columnNames = columns.map((column) => escapeId(column)).join(", ");
-      const placeholders = Array(columns.length).fill("?").join(", ");
-      const placeholdersPerRow = Array(batchData.length)
-        .fill(`(${placeholders})`)
-        .join(", ");
-
-      const sql = `INSERT IGNORE INTO Document (${columnNames}) VALUES ${placeholdersPerRow}`;
-
-      await db.query(sql, batchValues);
-      insertCounter++;
+    const insertValues = [];
+    for (const record of data) {
+      insertValues.push(...columns.map((column) => record[column]));
     }
 
+    const columnNames = columns.map((column) => escapeId(column)).join(", ");
+    const placeholders = Array(columns.length).fill("?").join(", ");
+    const placeholdersPerRow = Array(data.length)
+      .fill(`(${placeholders})`)
+      .join(", ");
+
+    const sql = `INSERT IGNORE INTO Document (${columnNames}) VALUES ${placeholdersPerRow}`;
+
+    await db.query(sql, insertValues);
+    insertCounter++;
+
     console.log(
-      `Data inserted into the database successfully, ${insertCounter} rows inserted`
+      `Data inserted into the database successfully, ${insertValues.length} rows inserted`
     );
     return {
       success: true,
@@ -283,8 +292,8 @@ app.get("/exportCSV", async (req, res) => {
     const csvFields = Object.keys(rows[0]);
     const csvData = parse(rows, { fields: csvFields });
 
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="data.csv"');
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="data.csv"');
     res.status(200).send(csvData);
   } catch (error) {
     console.error("Error exporting data as CSV:", error.message);
@@ -387,9 +396,11 @@ function getSqlQuery(req, isExport) {
     query += conditions.join(" AND ");
     countQuery += conditions.join(" AND ");
   }
-  if (isExport)
+  if (isExport) {
     query += ` ORDER BY entryDate`;
-  else
+  }
+  else {
     query += ` ORDER BY entryDate LIMIT ${pageSize} OFFSET ${offset}`;
+  }
   return { query, countQuery };
 }

@@ -2,7 +2,6 @@ CREATE DATABASE CoastalLife;
 USE CoastalLife;
 
 CREATE TABLE Document (
-  id INT AUTO_INCREMENT PRIMARY KEY,
   propertyId TEXT NULL,
   address_houseNumber INT NULL,
   address_street TEXT NULL,
@@ -151,10 +150,12 @@ CREATE TABLE Document (
   mls_taxes_description_1 VARCHAR(200) NULL,
   mls_taxes_description_2 VARCHAR(200) NULL,
   PREVIOUS_MLS_STATUS ENUM("Pending", "Sold", "Active", "Cancel") NULL,
-  entryDate DATE NULL
+  entryDate DATE NULL,
+  uniqueHash VARCHAR(250) NOT NULL PRIMARY KEY
 );
 
 
+CREATE INDEX idx_address_city ON Document (address_city(255));
 CREATE INDEX idx_address_state ON Document (address_state(255));
 CREATE INDEX idx_mls_propertyType ON Document (mls_propertyType(255));
 CREATE INDEX idx_mls_propertySubtype ON Document (mls_propertySubtype(255));
@@ -162,3 +163,4 @@ CREATE INDEX idx_address_zip ON Document (address_zip);
 CREATE INDEX idx_address_county ON Document (address_county(255));
 CREATE INDEX idx_mls_soldDate ON Document (mls_soldDate);
 CREATE INDEX idx_mls_status ON Document (mls_status);
+CREATE INDEX idx_entryDate ON Document (entryDate);
