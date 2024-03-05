@@ -108,28 +108,40 @@ async function processCSV(filePath, totalRows, jobId) {
       .on("data", async (row) => {
         numConcurrent++;
         rowsProcessed++;
-        row.entryDate = fromFormat(row.entryDate, "MM/DD/YYYY").toFormat(
-          "YYYY-MM-DD"
-        );
-        row.mls_failedListingDate = fromFormat(
-          row.mls_failedListingDate,
-          "MM/DD/YYYY"
-        ).toFormat("YYYY-MM-DD");
-        row.mls_maxListPriceDate = fromFormat(
-          row.mls_maxListPriceDate,
-          "MM/DD/YYYY"
-        ).toFormat("YYYY-MM-DD");
-        row.mls_minListPriceDate = fromFormat(
-          row.mls_minListPriceDate,
-          "MM/DD/YYYY"
-        ).toFormat("YYYY-MM-DD");
-        row.mls_originalListingDate = fromFormat(
-          row.mls_originalListingDate,
-          "MM/DD/YYYY"
-        ).toFormat("YYYY-MM-DD");
-        row.mls_soldDate = fromFormat(row.mls_soldDate, "MM/DD/YYYY").toFormat(
-          "YYYY-MM-DD"
-        );
+        if (row.entryDate) {
+          row.entryDate = fromFormat(row.entryDate, "MM/DD/YYYY").toFormat(
+            "YYYY-MM-DD"
+          );
+        }
+        if (row.mls_failedListingDate) {
+          row.mls_failedListingDate = fromFormat(
+            row.mls_failedListingDate,
+            "MM/DD/YYYY"
+          ).toFormat("YYYY-MM-DD");
+        }
+        if (row.mls_maxListPriceDate) {
+          row.mls_maxListPriceDate = fromFormat(
+            row.mls_maxListPriceDate,
+            "MM/DD/YYYY"
+          ).toFormat("YYYY-MM-DD");
+        }
+        if (row.mls_minListPriceDate) {
+          row.mls_minListPriceDate = fromFormat(
+            row.mls_minListPriceDate,
+            "MM/DD/YYYY"
+          ).toFormat("YYYY-MM-DD");
+        }
+        if (row.mls_originalListingDate) {
+          row.mls_originalListingDate = fromFormat(
+            row.mls_originalListingDate,
+            "MM/DD/YYYY"
+          ).toFormat("YYYY-MM-DD");
+        }
+        if (row.mls_soldDate) {
+          row.mls_soldDate = fromFormat(row.mls_soldDate, "MM/DD/YYYY").toFormat(
+            "YYYY-MM-DD"
+          );
+        }
         rows.push(row);
 
         if (numConcurrent >= maxConcurrent) {
@@ -182,6 +194,7 @@ app.get("/getData", async (req, res) => {
       db.query(countQuery),
     ]);
     console.log("Generated query:", query);
+    console.log("Generated query:", countQuery);
 
     res
       .status(200)
@@ -260,7 +273,7 @@ server.listen(3001, () => {
 
 app.get("/exportCSV", async (req, res) => {
   try {
-    const { query } = getSqlQuery(req);
+    const { query } = getSqlQuery(req, true);
     const [rows] = await db.query(query);
 
     if (rows.length === 0) {
